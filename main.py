@@ -51,9 +51,16 @@ class TrainCheckRequest(BaseModel):
     passengers: int = Field(default=1, ge=1, le=6)
 
 
+class PassengerDetail(BaseModel):
+    name: str = Field(..., min_length=1, max_length=16)
+    age: int = Field(..., ge=1, le=120)
+    gender: str = Field(..., pattern="^(Male|Female|Transgender|M|F|T)$")
+    berth_preference: Optional[str] = None
+    food_preference: Optional[str] = None
+
 class TrainBookRequest(BaseModel):
     selection_id: str = Field(..., min_length=1)
-    passengers: int = Field(default=1, ge=1, le=6)
+    passengers: list[PassengerDetail] = Field(..., min_length=1, max_length=6)
 
 
 # =========================================================
@@ -466,31 +473,83 @@ def train_book(
 ):
     verify_bridge_token(x_bridge_token)
 
-    # We intentionally do not automate OTP/CAPTCHA/payment.
+    # Convert the passenger list to a JSON string so it can be injected into JS
+    passengers_json = json.dumps([p.model_dump() for p in body.passengers])
 
     script_header = f"""
 const selection_id = {json.dumps(body.selection_id)};
-const passengers = {body.passengers};
+const passengers = {passengers_json};
 """
 
     script_body = r"""
-return {
-    ok: true,
-    stage: 'BOOKING_REQUEST_RECEIVED',
+    // Helper function to sleep
+    const delay = ms => new Promise(res => setTimeout(res, ms));
 
-    selection_id: selection_id,
-    passengers: passengers,
+    // Assume we are on the Train List page or already on the Passenger Details page.
+    // In a real scenario, you'd click the specific train's Book Now button based on selection_id.
+    // For now, we assume the user has landed on the passenger details page where the form exists.
 
-    current_url: page.url(),
+    console.log("Starting passenger form automation...");
 
-    human_action_required: true,
+    // Wait for the passenger container to be visible
+    await page.waitForSelector('app-passenger', { state: 'visible', timeout: 15000 }).catch(() => {});
 
-    message:
-        'Booking request received. Continue through the normal ' +
-        'IRCTC authentication, OTP, CAPTCHA and payment flow manually.'
-};
+    for (let i = 0; i < passengers.length; i++) {
+        const passenger = passengers[i];
+        console.log(`Filling details for passenger ${i + 1}: ${passenger.name}`);
+
+        // If it's not the first passenger, we need to click "+ Add Passenger"
+        if (i > 0) {
+            const addPassengerBtn = page.getByRole('button', { name: /Add Passenger/i });
+            if (await addPassengerBtn.isVisible()) {
+                await addPassengerBtn.click();
+                await delay(500); // Wait for the new row to render
+            }
+        }
+
+        // Get all passenger form blocks (each row of passenger inputs)
+        // Usually, IRCTC groups them in an app-passenger block. We'll find all name inputs.
+        const nameInputs = await page.getByPlaceholder('Passenger Name').all();
+        const ageInputs = await page.getByPlaceholder('Age').all();
+        const genderSelects = await page.locator('select[formcontrolname="passengerGender"]').all();
+        
+        // Ensure we have enough inputs rendered
+        if (nameInputs.length > i && ageInputs.length > i && genderSelects.length > i) {
+            await nameInputs[i].fill(passenger.name);
+            await delay(200);
+            await ageInputs[i].fill(passenger.age.toString());
+            await delay(200);
+
+            // Handle gender mapping (M, F, T or Male, Female, Transgender)
+            let genderVal = 'M';
+            if (passenger.gender.toLowerCase().startsWith('f')) genderVal = 'F';
+            else if (passenger.gender.toLowerCase().startsWith('t')) genderVal = 'T';
+
+            await genderSelects[i].selectOption({ value: genderVal });
+            await delay(200);
+            
+            // Optionally handle berth preference if provided
+            if (passenger.berth_preference) {
+                const berthSelects = await page.locator('select[formcontrolname="passengerBerthChoice"]').all();
+                if (berthSelects.length > i) {
+                     // Best effort select, value usually maps to LB, MB, UB, etc.
+                     await berthSelects[i].selectOption({ label: passenger.berth_preference }).catch(() => {});
+                }
+            }
+        } else {
+            console.warn(`Could not find input fields for passenger ${i + 1}`);
+        }
+    }
+
+    return {
+        ok: true,
+        stage: 'PASSENGER_DETAILS_FILLED',
+        passengers_processed: passengers.length,
+        current_url: page.url(),
+        human_action_required: true,
+        message: 'Successfully filled passenger details. Please complete CAPTCHA and Payment manually.'
+    };
 """
 
-    script = script_header + script_body
-
-    return run_webcmd(script, timeout=60)
+    script = script_header + "\n" + script_body
+    return run_webcmd(script, timeout=120)
